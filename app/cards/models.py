@@ -57,3 +57,8 @@ class CardData(BaseModel):
     scale: int | None = None
     pend_desc: str | None = None
     monster_desc: str | None = None
+
+    # Campo nosso, nao vem da API - setado manualmente pra False quando o
+    # service cai no fallback em ingles (nenhum resultado do filtro tinha
+    # traducao PT ainda), pra avisar antes de gerar a carta.
+    traduzida: bool = True

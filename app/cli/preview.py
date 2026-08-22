@@ -14,6 +14,8 @@ console = Console()
 
 def mostrar_ficha(carta: CardData) -> None:
     linhas = [f"[bold]{carta.name}[/] ({carta.type})"]
+    if not carta.traduzida:
+        linhas.append("[red]Sem traducao PT - nome/texto em ingles[/]")
     if carta.attribute:
         linhas.append(f"Atributo: {carta.attribute}")
     if carta.race:

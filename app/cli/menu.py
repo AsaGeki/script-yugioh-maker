@@ -50,8 +50,10 @@ def _mostrar_tabela(cartas: list[CardData]) -> None:
     tabela = Table(title=f"Cartas ({len(cartas)})")
     tabela.add_column("Nome")
     tabela.add_column("Tipo")
+    tabela.add_column("PT")
     for carta in cartas:
-        tabela.add_row(carta.name, str(carta.type))
+        pt = "[green]sim[/]" if carta.traduzida else "[red]nao[/]"
+        tabela.add_row(carta.name, str(carta.type), pt)
     console.print(tabela)
 
 
@@ -60,6 +62,10 @@ async def _gerar_uma(
 ) -> None:
     """No lote (`confirmar=False`), a selecao no checkbox ja e a confirmacao -
     so pergunta de novo quando ha variante de arte (escolher_variante)."""
+    if not carta.traduzida:
+        console.print(
+            f'  [red]![/] "{carta.name}" sem traducao PT - vai sair em ingles'
+        )
     imagem = await escolher_variante(carta)
     if (
         confirmar

@@ -1,8 +1,11 @@
+import asyncio
 import logging
 import unicodedata
+from typing import Any
 
 import httpx
 
+from app.cards.konami import buscar_traducao_oficial
 from app.cards.models import CardData
 
 BASE_URL = "https://db.ygoprodeck.com/api/v7/cardinfo.php"
@@ -19,6 +22,32 @@ def _normalizar(texto: str) -> str:
     sem_acento = unicodedata.normalize("NFD", texto)
     sem_acento = "".join(c for c in sem_acento if unicodedata.category(c) != "Mn")
     return sem_acento.lower().strip()
+
+
+def _konami_id_de(bruto: dict[str, Any]) -> int | None:
+    return (bruto.get("misc_info") or [{}])[0].get("konami_id")
+
+
+async def _tentar_traducao_oficial(carta: CardData, bruto: dict[str, Any]) -> None:
+    """Ultima tentativa antes de desistir da traducao PT: usa o konami_id
+    (misc_info da API) pra puxar nome+texto do banco oficial da Konami -
+    cobre o caso da YGOPRODeck ainda nao ter importado uma traducao que a
+    Konami ja lancou (ver app.cards.konami)."""
+    konami_id = _konami_id_de(bruto)
+    traducao = await buscar_traducao_oficial(konami_id) if konami_id else None
+    if traducao:
+        carta.name = traducao["name"]
+        carta.desc = traducao["desc"]
+        logger.info(
+            '"%s": sem traducao PT na YGOPRODeck, mas achada no banco oficial da Konami',
+            carta.name,
+        )
+    else:
+        carta.traduzida = False
+        logger.warning(
+            '"%s": sem traducao PT em nenhuma das 2 fontes, usando o texto em ingles',
+            carta.name,
+        )
 
 
 async def _avisar_se_traducao_incompleta(
@@ -61,10 +90,12 @@ async def find_card_by_id(card_id: int) -> CardData | None:
     "carta nao existe".
     """
     async with httpx.AsyncClient() as client:
-        resp = await client.get(BASE_URL, params={"id": card_id, "language": "pt"})
+        resp = await client.get(
+            BASE_URL, params={"id": card_id, "language": "pt", "misc": "yes"}
+        )
         sem_traducao_pt = resp.status_code == 400
         if sem_traducao_pt:
-            resp = await client.get(BASE_URL, params={"id": card_id})
+            resp = await client.get(BASE_URL, params={"id": card_id, "misc": "yes"})
             if resp.status_code == 400:
                 return None
         resp.raise_for_status()
@@ -75,11 +106,7 @@ async def find_card_by_id(card_id: int) -> CardData | None:
 
         carta = CardData.model_validate(dados[0])
         if sem_traducao_pt:
-            logger.warning(
-                '"%s" (id %s): sem traducao PT na base da API, usando o texto em ingles',
-                carta.name,
-                card_id,
-            )
+            await _tentar_traducao_oficial(carta, dados[0])
         else:
             await _avisar_se_traducao_incompleta(client, carta)
 
@@ -136,19 +163,30 @@ async def _buscar_cartas(params: dict[str, str]) -> list[CardData]:
     bate em cartas ainda nao traduzidas. Cai pra ingles nesse caso em vez de
     fingir que nao achou nada.
     """
+    sem_traducao_pt = False
     async with httpx.AsyncClient() as client:
-        resp = await client.get(BASE_URL, params={**params, "language": "pt"})
+        resp = await client.get(
+            BASE_URL, params={**params, "language": "pt", "misc": "yes"}
+        )
         if resp.status_code == 400:
-            resp = await client.get(BASE_URL, params=params)
+            resp = await client.get(BASE_URL, params={**params, "misc": "yes"})
             if resp.status_code == 400:
                 return []  # dessa vez sim, nenhuma carta bate com o filtro
-            logger.warning(
-                "Filtro %s: sem resultado com traducao PT, mostrando em ingles", params
-            )
+            sem_traducao_pt = True
         resp.raise_for_status()
         dados = resp.json().get("data") or []
 
-    return [CardData.model_validate(item) for item in dados]
+    cartas = [CardData.model_validate(item) for item in dados]
+    if sem_traducao_pt:
+        # 1 tentativa de traducao oficial por carta, em paralelo - senao,
+        # buscar um resultado com varias cartas sem traducao ficaria lento
+        await asyncio.gather(
+            *(
+                _tentar_traducao_oficial(carta, bruto)
+                for carta, bruto in zip(cartas, dados)
+            )
+        )
+    return cartas
 
 
 async def search_cards(
