@@ -1,14 +1,17 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
+from app.cards.models import CardData
 from app.cards.service import find_card_by_name
+from app.errors import NotFoundError
+from app.response import ApiResponse
 
 router = APIRouter()
 
 
 # GET /cards/{name} -> busca carta oficial pelo nome em portugues, retorna dados ja em PT
-@router.get("/cards/{name}")
+@router.get("/cards/{name}", response_model=ApiResponse[CardData])
 async def get_card(name: str):
     carta = await find_card_by_name(name)
     if not carta:
-        raise HTTPException(status_code=404, detail=f'Carta "{name}" nao encontrada')
-    return carta
+        raise NotFoundError(f'Carta "{name}" nao encontrada')
+    return ApiResponse(message="Carta encontrada!", data=carta)

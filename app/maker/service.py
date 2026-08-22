@@ -10,6 +10,7 @@ from app.cards.enums import CardType, LinkMarker, MonsterRace, SpellTrapSubtype
 from app.cards.models import CardData
 from app.cards.service import find_card_by_name
 from app.config import HEADLESS, OUTPUT_DIR
+from app.errors import BadRequestError, NotFoundError
 
 MAKER_URL = "https://yugiohcardmaker.org/pt#card-editor"
 OUTPUT_PATH = Path(OUTPUT_DIR)
@@ -27,15 +28,11 @@ def _container(page: Page, texto_label: str):
     return page.locator("label", has_text=re.compile(f"^{texto_label}$")).locator("..")
 
 
-# O <select> nativo de raca do site traduz errado varias delas pro PT oficial
-# da Konami (conferido contra https://www.db.yugioh-card.com): Spellcaster
-# sai como "Conjurador" (deveria ser "Mago"), Zombie/Cyberse/Pyro saem sem
-# traduzir, Fiend sai com acento errado ("Demónio" em vez de "Demônio"),
-# Beast-Warrior sai no genero errado ("Besta-Guerreiro" em vez de
-# "Besta-Guerreira"). Em vez de ter 2 caminhos (select nativo pras raças
-# certas, campo customizado só pras erradas), usamos SEMPRE o campo
-# "Personalizado" do site com o termo oficial - mais simples e garante
-# consistencia, sem depender de nenhuma traducao do proprio maker.
+# O <select> nativo de raca do site traduz errado varias pro PT oficial da
+# Konami (Spellcaster -> "Conjurador", devia ser "Mago"; Zombie/Cyberse/Pyro
+# sem traducao; Fiend com acento errado; Beast-Warrior no genero errado).
+# Por isso usamos SEMPRE o campo "Personalizado" com o termo certo, em vez
+# de decidir caso a caso quando confiar no select nativo.
 RACA_PT_OFICIAL: dict[MonsterRace, str] = {
     MonsterRace.AQUA: "Aqua",
     MonsterRace.BEAST: "Besta",
@@ -98,8 +95,7 @@ def _slug(texto: str) -> str:
 
 
 async def _baixar_imagem_temp(url: str) -> Path:
-    """Baixa a arte da carta (sem moldura) da API oficial pra um arquivo temporario,
-    pronto pra fazer upload no maker."""
+    """Baixa a arte (sem moldura) pra um arquivo temporario, pronto pra upload no maker."""
     async with httpx.AsyncClient() as client:
         resp = await client.get(url)
         resp.raise_for_status()
@@ -117,13 +113,11 @@ async def _enviar_imagem(page: Page, carta: CardData) -> None:
 
 
 async def _descarregar_carta(page: Page, nome_carta: str) -> Path:
-    """Clica em "Atualizar Agora" (o preview/canvas nao reage sozinho aos
-    campos - sem isso, "Descarregar" baixa sempre o estado inicial/padrao da
-    pagina, igual em toda execucao, ignorando tudo que preenchemos; foi assim
-    que descobri isso: 2 cartas diferentes geraram o MESMO arquivo, hash
-    identico), depois clica "Descarregar", captura o download que o
-    Playwright intercepta, e salva em OUTPUT_PATH (config OUTPUT_DIR) com nome
-    baseado no nome da carta."""
+    """Clica "Atualizar Agora" (o preview nao reage sozinho aos campos - sem
+    isso "Descarregar" sempre baixa o estado padrao da pagina, ignorando tudo
+    que preenchemos; descoberto porque 2 cartas diferentes geraram o MESMO
+    arquivo, hash identico), depois "Descarregar", captura o download via
+    Playwright e salva em OUTPUT_PATH com nome baseado no nome da carta."""
     OUTPUT_PATH.mkdir(exist_ok=True)
     await page.get_by_role("button", name="Atualizar Agora", exact=True).click()
     async with page.expect_download() as download_info:
@@ -147,23 +141,17 @@ class ConfigSubtipo:
 
 # Mapeia os 29 valores de CardType pro Subtipo + tracos do site.
 #
-# O site tem 2 selects de traco independentes (confirmado testando ao vivo):
-# o 1o (label "Efeito") e obrigatorio, sem opcao vazia; o 2o (sem label, na
-# mesma linha, sempre o ultimo <select> dela) tem opcao "none" e serve pra
-# combinar um 2o traco. Cada select remove da propria lista de opcoes o valor
-# que esta selecionado no OUTRO (pra nao poder repetir); por isso sempre
-# preenchemos traco1 antes de traco2.
+# O site tem 2 selects de traco independentes: o 1o (label "Efeito") e
+# obrigatorio, sem opcao vazia; o 2o (sem label, ultimo <select> da linha) tem
+# opcao "none" e combina um 2o traco. Cada select remove da lista a opcao ja
+# selecionada no OUTRO - por isso sempre preenchemos traco1 antes de traco2.
 #
-# O valor "normal" do traco2 tem rotulo DIFERENTE do traco1: no traco1 e
-# "Normal", no traco2 e "Efeito" (confirmado no <option> do proprio site).
-# O cabecalho de tipo que o site desenha acima da caixa de texto (ex:
-# "[Cyberse/Link]") concatena os tracos ativos - setar traco2="normal" faz
-# esse cabecalho ganhar "/Efeito", batendo com o formato oficial da Konami
-# ("Raca／Subtipo／Efeito", ver https://www.db.yugioh-card.com). So NAO
-# fazemos isso pros tipos que sao normais de verdade (sem efeito real: Normal,
-# Ritual sem efeito, Pendulum Normal, Normal Tuner, Token) e no caso unico de
-# traco2 ja ocupado por um 2o traco real (Flip Tuner Effect Monster - nesse
-# caso o cabecalho fica sem "/Efeito", limitacao aceita: so 1 slot de traco2).
+# traco2="normal" tem rotulo "Efeito" (diferente do traco1, que e "Normal") e
+# faz o cabecalho de tipo do card ganhar "/Efeito", batendo com o formato
+# oficial da Konami ("Raca／Subtipo／Efeito"). So NAO fazemos isso pros tipos
+# realmente normais (Normal, Ritual sem efeito, Pendulum Normal, Normal
+# Tuner, Token) nem quando traco2 ja tem um 2o traco real (Flip Tuner Effect
+# Monster - cabecalho fica sem "/Efeito" nesse caso, so 1 slot disponivel).
 CONFIG_POR_TIPO: dict[CardType, ConfigSubtipo] = {
     CardType.NORMAL_MONSTER: ConfigSubtipo("Normal", "normal", "none", False),
     CardType.EFFECT_MONSTER: ConfigSubtipo("Effect", "normal", "normal", False),
@@ -229,43 +217,41 @@ async def _resolver_carta(nome_ou_carta: str | CardData) -> CardData:
         return nome_ou_carta
     carta = await find_card_by_name(nome_ou_carta)
     if not carta:
-        raise ValueError(f'Carta "{nome_ou_carta}" nao encontrada na API')
+        raise NotFoundError(f'Carta "{nome_ou_carta}" nao encontrada na API')
     return carta
 
 
 async def fill_monster_card(nome_carta: str | CardData) -> Path:
-    """Busca a carta na API oficial (ou usa uma ja carregada, ver
-    _resolver_carta), preenche o Yu-Gi-Oh! Card Maker (dados + arte) e
-    descarrega o resultado. Cobre qualquer monstro
-    (Normal/Effect/Fusion/Ritual/Synchro/Xyz/Link, Pendulum ou nao, com traco
-    Toon/Spirit/Union/Gemini/Flip/Tuner). Spell/Trap ficam de fora (fora de
-    escopo deste service - ver fill_spell_trap_card). Retorna o caminho do
-    arquivo baixado.
+    """Busca a carta (ou usa uma ja carregada, ver _resolver_carta), preenche
+    o Yu-Gi-Oh! Card Maker (dados + arte) e descarrega o resultado. Cobre
+    qualquer monstro (Normal/Effect/Fusion/Ritual/Synchro/Xyz/Link, Pendulum
+    ou nao, com traco Toon/Spirit/Union/Gemini/Flip/Tuner). Spell/Trap ficam
+    de fora - ver fill_spell_trap_card. Retorna o caminho do arquivo baixado.
     """
     carta = await _resolver_carta(nome_carta)
     if carta.type in (CardType.SPELL_CARD, CardType.TRAP_CARD):
-        raise ValueError(
+        raise BadRequestError(
             f'"{carta.name}" nao e um monstro (type: "{carta.type}") - fill_monster_card so suporta monstros'
         )
     if carta.attribute is None:
-        raise ValueError(f'"{carta.name}" esta sem atributo')
+        raise BadRequestError(f'"{carta.name}" esta sem atributo')
     if carta.atk is None:
-        raise ValueError(f'"{carta.name}" esta sem ataque')
+        raise BadRequestError(f'"{carta.name}" esta sem ataque')
     config = CONFIG_POR_TIPO.get(carta.type)
     if not config:
-        raise ValueError(
+        raise BadRequestError(
             f'Tipo "{carta.type}" nao tem mapeamento de Subtipo/traco em CONFIG_POR_TIPO'
         )
 
     eh_link = config.subtipo == "Link"
     if eh_link:
         if not carta.linkmarkers:
-            raise ValueError(f'"{carta.name}" e Link Monster mas nao tem linkmarkers')
+            raise BadRequestError(f'"{carta.name}" e Link Monster mas nao tem linkmarkers')
     elif carta.level is None or carta.def_ is None:
         # Link Monster manda level/def como null de verdade (usa linkval/sem defesa) - so exigimos aqui fora do caso Link
-        raise ValueError(f'"{carta.name}" esta sem nivel/defesa')
+        raise BadRequestError(f'"{carta.name}" esta sem nivel/defesa')
     if config.pendulo and (carta.scale is None or carta.pend_desc is None):
-        raise ValueError(f'"{carta.name}" e carta Pendulum mas nao tem scale/pend_desc')
+        raise BadRequestError(f'"{carta.name}" e carta Pendulum mas nao tem scale/pend_desc')
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
@@ -277,11 +263,9 @@ async def fill_monster_card(nome_carta: str | CardData) -> Path:
         try:
             await page.goto(MAKER_URL)
 
-            # espera o campo Nome existir ANTES de mexer em qualquer outro
-            # campo - e o sinal de que o form terminou de carregar (fontes/JS
-            # async). Sem isso, os primeiros selects as vezes respondem mas
-            # os campos mais pro fim do form ainda nao existem, e a interacao
-            # trava ate estourar o timeout.
+            # espera o campo Nome existir ANTES de mexer em outro campo - sinal
+            # de que o form (fontes/JS async) terminou de carregar. Sem isso os
+            # campos do fim do form ainda nao existem e a interacao trava.
             campo_nome = _container(page, "Nome da Carta").locator("input")
             await campo_nome.wait_for()
 
@@ -314,13 +298,11 @@ async def fill_monster_card(nome_carta: str | CardData) -> Path:
                 .locator("select")
                 .select_option(carta.attribute.value)
             )
-            # O select nativo de raca traduz varias raças errado pro PT
-            # oficial (ver nota em RACA_PT_OFICIAL) - em vez de usa-lo,
-            # marcamos "Personalizado" (checkbox rotulado "Tipo", mesmo
-            # padrao label.btn/input escondido do Pendulo) e preenchemos o
-            # campo de texto livre que aparece no lugar do select.
-            # carta.race e MonsterRace | SpellTrapSubtype, mas ja barramos Spell/Trap acima -
-            # nesse ponto so pode ser MonsterRace (o model so aceita SpellTrapSubtype pra Spell/Trap)
+            # Select nativo de raca traduz errado (ver RACA_PT_OFICIAL) - em vez
+            # de usa-lo, marcamos "Personalizado" (mesmo padrao label.btn/input
+            # escondido do Pendulo, ver nota abaixo) e preenchemos o texto livre.
+            # carta.race e MonsterRace | SpellTrapSubtype, mas ja barramos Spell/Trap
+            # acima - aqui so pode ser MonsterRace.
             container_personalizado = _container(page, "Tipo")
             campo_personalizado_input = container_personalizado.locator(
                 "input[type=checkbox]"
@@ -332,11 +314,9 @@ async def fill_monster_card(nome_carta: str | CardData) -> Path:
                 RACA_PT_OFICIAL[carta.race]
             )
 
-            # o <input type=checkbox> real fica escondido atras do <label
-            # class="btn ..."> que o Bootstrap estiliza como botao toggle -
-            # clicar direto no input falha (o label intercepta o clique
-            # visualmente); a leitura de estado (is_checked) continua no
-            # input, mas o clique tem que mirar no label clicavel
+            # <input type=checkbox> real fica escondido atras do <label
+            # class="btn ..."> (Bootstrap estiliza como botao toggle) - clicar
+            # direto no input falha, so no label; leitura de estado continua no input
             container_pendulo = _container(page, "Pêndulo")
             campo_pendulo_input = container_pendulo.locator("input[type=checkbox]")
             campo_pendulo_label = container_pendulo.locator("label.btn")
@@ -365,11 +345,9 @@ async def fill_monster_card(nome_carta: str | CardData) -> Path:
                     .fill(str(_tamanho_fonte(texto_pendulo)))
                 )
 
-            # o card de exemplo que o site carrega por padrao vem com esse
-            # checkbox MARCADO, o que injeta um cabecalho tipo
-            # "[Conjurador/Invocacao Especial]" no topo do texto - errado pra
-            # quase toda carta (nao temos como saber pela API quando isso
-            # deveria estar ligado), entao sempre desmarcamos
+            # card de exemplo padrao do site vem com esse checkbox MARCADO
+            # (injeta cabecalho tipo "[Conjurador/Invocacao Especial]" no
+            # texto) - errado pra quase toda carta, entao sempre desmarcamos
             container_invocacao = _container(page, "Invocação Especial")
             campo_invocacao_input = container_invocacao.locator("input[type=checkbox]")
             campo_invocacao_label = container_invocacao.locator("label.btn")
@@ -427,17 +405,16 @@ async def fill_monster_card(nome_carta: str | CardData) -> Path:
 
 
 async def fill_spell_trap_card(nome_carta: str | CardData) -> Path:
-    """Busca a carta na API oficial (ou usa uma ja carregada, ver
-    _resolver_carta), preenche o Yu-Gi-Oh! Card Maker (dados + arte) e
-    descarrega o resultado, pra uma Magia ou Armadilha. Bem mais simples que
-    fill_monster_card: nenhum campo de monstro
-    (Atributo/Tipo/Nivel/ATK/DEF/Pendulo/Link) existe pra Spell/Trap -
-    confirmado testando ao vivo, todos ficam invisiveis no form. Retorna o
-    caminho do arquivo baixado.
+    """Busca a carta (ou usa uma ja carregada, ver _resolver_carta), preenche
+    o Yu-Gi-Oh! Card Maker (dados + arte) e descarrega o resultado, pra uma
+    Magia ou Armadilha. Bem mais simples que fill_monster_card: nenhum campo
+    de monstro (Atributo/Tipo/Nivel/ATK/DEF/Pendulo/Link) existe pra
+    Spell/Trap, todos ficam invisiveis no form. Retorna o caminho do arquivo
+    baixado.
     """
     carta = await _resolver_carta(nome_carta)
     if carta.type not in (CardType.SPELL_CARD, CardType.TRAP_CARD):
-        raise ValueError(
+        raise BadRequestError(
             f'"{carta.name}" nao e Magia/Armadilha (type: "{carta.type}") - use fill_monster_card'
         )
     # o model so aceita SpellTrapSubtype pra Spell/Trap Card
@@ -492,15 +469,14 @@ async def fill_spell_trap_card(nome_carta: str | CardData) -> Path:
 
 async def fill_card(nome_carta: str) -> Path:
     """Busca a carta pelo nome e despacha pro preenchimento certo (monstro vs
-    magia/armadilha) - os 2 formularios sao bem diferentes no site, entao
-    cada um tem seu proprio service. Busca so 1 vez aqui e repassa a CardData
-    ja carregada pro fill_* especifico (_resolver_carta aceita os 2 - nome ou
-    CardData -, entao cada fill_* continua utilizavel sozinho com so o nome).
-    Retorna o caminho do arquivo baixado.
+    magia/armadilha - formularios bem diferentes, cada um com seu proprio
+    service). Busca so 1 vez e repassa a CardData ja carregada pro fill_*
+    especifico (_resolver_carta aceita nome ou CardData, entao cada fill_*
+    continua utilizavel sozinho so com o nome). Retorna o caminho baixado.
     """
     carta = await find_card_by_name(nome_carta)
     if not carta:
-        raise ValueError(f'Carta "{nome_carta}" nao encontrada na API')
+        raise NotFoundError(f'Carta "{nome_carta}" nao encontrada na API')
 
     if carta.type in (CardType.SPELL_CARD, CardType.TRAP_CARD):
         return await fill_spell_trap_card(carta)

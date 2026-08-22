@@ -22,13 +22,11 @@ def _normalizar(texto: str) -> str:
 async def _avisar_se_traducao_incompleta(
     client: httpx.AsyncClient, carta: CardData
 ) -> None:
-    """A API oficial as vezes devolve `language=pt` mas nao traduziu de fato
-    algum campo especifico dessa carta (ex: pend_desc de cartas Pendulum mais
-    novas) - o texto volta identico ao ingles, sem erro nenhum, dado
-    incompleto na base deles mesmo. Detecta comparando com a versao em ingles
-    da mesma carta (mesmo id, sem language) e avisa via logging - nao tem como
-    corrigir o texto em si, so sinalizar que essa carta precisa de revisao
-    manual.
+    """A API as vezes devolve `language=pt` sem ter traduzido de fato algum
+    campo (ex: pend_desc de Pendulum mais novas) - volta identico ao ingles,
+    dado incompleto na base deles mesmo. Detecta comparando com a versao em
+    ingles (mesmo id, sem language) e so avisa via logging - nao ha como
+    corrigir o texto, so sinalizar revisao manual.
     """
     resp = await client.get(BASE_URL, params={"id": carta.id})
     if resp.status_code != 200:
@@ -54,14 +52,11 @@ async def _avisar_se_traducao_incompleta(
 async def find_card_by_name(nome_pt: str) -> CardData | None:
     """Busca 1 carta na API oficial YGOPRODeck pelo nome em portugues.
 
-    `name` (busca exata) nao aceita `language=pt` junto (a API so casa nome
-    exato contra o nome em ingles). Mas `fname` (busca parcial/fuzzy) aceita
-    os 2 juntos e casa contra o nome ja traduzido - por isso usamos fname aqui.
-
-    Como fname e parcial, pode retornar varias cartas (ex: "Mago Negro"
-    tambem acha "Mago Negro do Caos", "Cortina de Mago Negro" etc).
-    Preferimos o resultado cujo nome bate exato (ignorando acento/caixa);
-    senao, usamos o primeiro da lista.
+    `name` (busca exata) nao aceita `language=pt` junto - so casa contra o
+    nome em ingles. `fname` (parcial/fuzzy) aceita os 2 e casa contra o nome
+    ja traduzido, por isso usamos fname. Como e parcial pode vir mais de 1
+    resultado (ex: "Mago Negro" tambem acha "Mago Negro do Caos") -
+    preferimos o nome que bate exato (ignorando acento/caixa), senao o 1o.
     """
     async with httpx.AsyncClient() as client:
         resp = await client.get(BASE_URL, params={"fname": nome_pt, "language": "pt"})
