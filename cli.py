@@ -5,8 +5,12 @@ import typer
 from rich.console import Console
 from rich.logging import RichHandler
 
+from app.cli.menu import main as rodar_menu_interativo
+from app.cli.stdio import configurar_stdio_utf8
 from app.errors import AppError
 from app.maker.service import fill_card
+
+configurar_stdio_utf8()
 
 app = typer.Typer()
 console = Console()
@@ -15,6 +19,13 @@ logging.basicConfig(
     format="%(message)s",
     handlers=[RichHandler(console=console, show_time=False, show_path=False)],
 )
+
+
+@app.callback(invoke_without_command=True)
+def principal(ctx: typer.Context):
+    """Sem subcomando nenhum, abre o menu interativo. Com `fill "nome"`, gera direto sem menu."""
+    if ctx.invoked_subcommand is None:
+        rodar_menu_interativo()
 
 
 @app.command()
