@@ -108,12 +108,14 @@ async def _enviar_imagem(page: Page, imagem_url: str) -> None:
     await page.locator("input[type=file]").set_input_files(str(caminho_imagem))
 
 
-async def _descarregar_carta(page: Page, nome_carta: str) -> Path:
+async def _descarregar_carta(page: Page, nome_carta: str, id_variante: int) -> Path:
     """Clica "Atualizar Agora" (o preview nao reage sozinho aos campos - sem
     isso "Descarregar" sempre baixa o estado padrao da pagina, ignorando tudo
     que preenchemos; descoberto porque 2 cartas diferentes geraram o MESMO
     arquivo, hash identico), depois "Descarregar", captura o download via
-    Playwright e salva em OUTPUT_PATH com nome baseado no nome da carta."""
+    Playwright e salva em OUTPUT_PATH. `id_variante` (id da arte usada, ver
+    CardImage) vai sempre no nome do arquivo - a API nao da nome de variante
+    nenhum, so o id e estavel o suficiente pra diferenciar."""
     OUTPUT_PATH.mkdir(exist_ok=True)
     await page.get_by_role("button", name="Atualizar Agora", exact=True).click()
     async with page.expect_download() as download_info:
@@ -122,7 +124,7 @@ async def _descarregar_carta(page: Page, nome_carta: str) -> Path:
         await page.get_by_role("button", name="Descarregar", exact=True).click()
     download = await download_info.value
     extensao = Path(download.suggested_filename).suffix or ".png"
-    destino = OUTPUT_PATH / f"{_slug(nome_carta)}{extensao}"
+    destino = OUTPUT_PATH / f"{_slug(nome_carta)}-{id_variante}{extensao}"
     await download.save_as(destino)
     return destino
 
@@ -303,7 +305,8 @@ async def fill_monster_card(
         campo_nome = _container(page, "Nome da Carta").locator("input")
         await campo_nome.wait_for()
 
-        await _enviar_imagem(page, (imagem or carta.card_images[0]).image_url_cropped)
+        variante_usada = imagem or carta.card_images[0]
+        await _enviar_imagem(page, variante_usada.image_url_cropped)
 
         await (
             _container(page, "Tipo de Carta").locator("select").select_option("Monster")
@@ -420,7 +423,7 @@ async def fill_monster_card(
         # usa carta.name (nome oficial), nao o argumento recebido -
         # que pode ser so o texto de busca (parcial) quando fill_card
         # ainda nao tinha resolvido a carta
-        return await _descarregar_carta(page, carta.name)
+        return await _descarregar_carta(page, carta.name, variante_usada.id)
 
 
 async def fill_spell_trap_card(
@@ -449,7 +452,8 @@ async def fill_spell_trap_card(
         campo_nome = _container(page, "Nome da Carta").locator("input")
         await campo_nome.wait_for()
 
-        await _enviar_imagem(page, (imagem or carta.card_images[0]).image_url_cropped)
+        variante_usada = imagem or carta.card_images[0]
+        await _enviar_imagem(page, variante_usada.image_url_cropped)
 
         tipo_valor = "Spell" if carta.type == CardType.SPELL_CARD else "Trap"
         await (
@@ -478,7 +482,7 @@ async def fill_spell_trap_card(
             .fill(str(_tamanho_fonte(carta.desc)))
         )
 
-        return await _descarregar_carta(page, carta.name)
+        return await _descarregar_carta(page, carta.name, variante_usada.id)
 
 
 async def fill_card(
