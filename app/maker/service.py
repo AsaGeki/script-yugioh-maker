@@ -1,6 +1,5 @@
 import re
 import tempfile
-import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -12,9 +11,13 @@ from app.cards.models import CardData, CardImage
 from app.cards.service import find_card_by_name
 from app.config import HEADLESS, OUTPUT_DIR
 from app.errors import BadRequestError, NotFoundError
+from app.slug import slug
 
 MAKER_URL = "https://yugiohcardmaker.org/pt#card-editor"
-OUTPUT_PATH = Path(OUTPUT_DIR)
+# pasta padrao pra carta avulsa (busca por nome/id, busca por arquetipo) -
+# quem monta deck (estrutural/publico/importado/montado na mao) passa a
+# propria pasta em `pasta_destino`, ver app.cli.menu
+PASTA_CARTAS_AVULSAS = Path(OUTPUT_DIR) / "cards"
 
 
 def _container(page: Page, texto_label: str):
@@ -69,25 +72,79 @@ def _subtipo_para_value_do_site(subtipo: SpellTrapSubtype) -> str:
     return "Quick" if subtipo == SpellTrapSubtype.QUICK_PLAY else subtipo.value
 
 
-def _tamanho_fonte(texto: str) -> int:
-    """Tamanho de fonte pro campo de texto (Informacao da Carta / Efeito do
-    Pendulo) - escala linear: maior pra texto curto, menor pra longo."""
-    fonte_maxima = 24  # texto bem curto (poucas dezenas de caracteres)
-    fonte_referencia = 18  # no comprimento de referencia (486 chars)
-    fonte_minima = 12  # piso pra texto bem longo, nunca fica ilegivel
-    comprimento_referencia = 486
+FONTE_MAXIMA = 28  # texto bem curto (poucas dezenas de caracteres)
+FONTE_MINIMA = 12  # piso pra texto bem longo, nunca fica ilegivel
 
-    fonte = fonte_maxima - (fonte_maxima - fonte_referencia) * (
-        len(texto) / comprimento_referencia
-    )
-    return round(max(fonte_minima, min(fonte_maxima, fonte)))
+# Calibrado gerando carta de teste com linhas fixas e vendo onde estoura, no
+# tamanho de fonte 20: Informacao da Carta de monstro cabe 8 linhas TOTAIS
+# (1 delas e sempre o cabecalho "[Raca/Subtipo/Efeito]" que o site injeta
+# sozinho - ver `linhas_reservadas`); Magia/Armadilha (sem ATK/DEF nem
+# cabecalho) cabe 11; Efeito do Pendulo cabe 6, mais estreito tambem (~44
+# chars/linha vs ~54 do resto). K_LARGURA/K_ALTURA = chars-por-linha e
+# linhas-que-cabem nesse tamanho de referencia, escalam na proporcao inversa
+# da fonte.
+_FONTE_REFERENCIA = 20
+_K_LARGURA = 54 * _FONTE_REFERENCIA
+_K_ALTURA = 8 * _FONTE_REFERENCIA
+_SPELL_TRAP_K_ALTURA = 11 * _FONTE_REFERENCIA
+_PENDULO_K_LARGURA = 44 * _FONTE_REFERENCIA
+_PENDULO_K_ALTURA = 6 * _FONTE_REFERENCIA
 
 
-def _slug(texto: str) -> str:
-    """Nome de carta -> nome de arquivo seguro (sem acento/espaco/maiuscula)."""
-    sem_acento = unicodedata.normalize("NFD", texto)
-    sem_acento = "".join(c for c in sem_acento if unicodedata.category(c) != "Mn")
-    return re.sub(r"[^a-zA-Z0-9]+", "-", sem_acento).strip("-").lower()
+def _quebrar_linha(palavras_restantes: str, largura: int) -> list[str]:
+    """Quebra 1 paragrafo em linhas de ate `largura` caracteres, so em
+    espaco - palavra sozinha maior que `largura` e hifenizada no limite (e
+    continua na(s) linha(s) seguinte(s)) em vez de estourar a linha, que e
+    o que o proprio site faz (corta no meio, sem "-" nenhum) quando a fonte
+    escolhida nao coube."""
+    linhas: list[str] = []
+    linha_atual = ""
+    for palavra in palavras_restantes.split(" "):
+        candidata = f"{linha_atual} {palavra}".strip()
+        if len(candidata) <= largura:
+            linha_atual = candidata
+            continue
+        if linha_atual:
+            linhas.append(linha_atual)
+            linha_atual = ""
+        while len(palavra) > largura:
+            linhas.append(palavra[: largura - 1] + "-")
+            palavra = palavra[largura - 1 :]
+        linha_atual = palavra
+    if linha_atual or not linhas:
+        linhas.append(linha_atual)
+    return linhas
+
+
+def _preparar_texto_e_fonte(
+    texto: str,
+    *,
+    k_largura: int = _K_LARGURA,
+    k_altura: int = _K_ALTURA,
+    linhas_reservadas: int = 0,
+) -> tuple[str, int]:
+    """Decide o tamanho de fonte E ja quebra o texto em linhas (\\n) antes de
+    mandar pro site - o yugiohcardmaker.org nao redimensiona a fonte sozinho
+    (o campo "Tamanho do Texto" e so um numero fixo) e corta palavra no meio
+    quando a linha nao cabe, em vez de quebrar ou hifenizar. Testa do maior
+    fonte pro menor e usa o primeiro que couber, ja com a quebra aplicada.
+
+    `k_largura`/`k_altura` trocam a calibracao pro box em questao (ver
+    constantes acima). `linhas_reservadas` reserva linhas do topo pro
+    cabecalho que o site injeta sozinho em carta de monstro.
+    """
+    paragrafos = texto.split("\n")
+    for fonte in range(FONTE_MAXIMA, FONTE_MINIMA - 1, -1):
+        largura = max(1, round(k_largura / fonte))
+        altura_max = max(1, round(k_altura / fonte) - linhas_reservadas)
+        linhas_por_paragrafo = [_quebrar_linha(p, largura) for p in paragrafos]
+        total_linhas = sum(len(linhas) for linhas in linhas_por_paragrafo)
+        if fonte == FONTE_MINIMA or total_linhas <= altura_max:
+            texto_final = "\n".join(
+                "\n".join(linhas) for linhas in linhas_por_paragrafo
+            )
+            return texto_final, fonte
+    raise AssertionError("loop sempre retorna ate FONTE_MINIMA")
 
 
 async def _baixar_imagem_temp(url: str) -> Path:
@@ -108,15 +165,18 @@ async def _enviar_imagem(page: Page, imagem_url: str) -> None:
     await page.locator("input[type=file]").set_input_files(str(caminho_imagem))
 
 
-async def _descarregar_carta(page: Page, nome_carta: str, id_variante: int) -> Path:
+async def _descarregar_carta(
+    page: Page, nome_carta: str, id_variante: int, pasta_destino: Path
+) -> Path:
     """Clica "Atualizar Agora" (o preview nao reage sozinho aos campos - sem
     isso "Descarregar" sempre baixa o estado padrao da pagina, ignorando tudo
     que preenchemos; descoberto porque 2 cartas diferentes geraram o MESMO
     arquivo, hash identico), depois "Descarregar", captura o download via
-    Playwright e salva em OUTPUT_PATH. `id_variante` (id da arte usada, ver
-    CardImage) vai sempre no nome do arquivo - a API nao da nome de variante
-    nenhum, so o id e estavel o suficiente pra diferenciar."""
-    OUTPUT_PATH.mkdir(exist_ok=True)
+    Playwright e salva em `pasta_destino` (cria se nao existir - decks salvam
+    em subpasta propria, ver app.cli.menu). `id_variante` (id da arte usada,
+    ver CardImage) vai sempre no nome do arquivo - a API nao da nome de
+    variante nenhum, so o id e estavel o suficiente pra diferenciar."""
+    pasta_destino.mkdir(parents=True, exist_ok=True)
     await page.get_by_role("button", name="Atualizar Agora", exact=True).click()
     async with page.expect_download() as download_info:
         # exact=True: a pagina tem outro elemento role=button cujo texto
@@ -124,9 +184,31 @@ async def _descarregar_carta(page: Page, nome_carta: str, id_variante: int) -> P
         await page.get_by_role("button", name="Descarregar", exact=True).click()
     download = await download_info.value
     extensao = Path(download.suggested_filename).suffix or ".png"
-    destino = OUTPUT_PATH / f"{_slug(nome_carta)}-{id_variante}{extensao}"
+    destino = pasta_destino / f"{slug(nome_carta)}-{id_variante}{extensao}"
     await download.save_as(destino)
     return destino
+
+
+# A barra do nome e preta/bem escura em Xyz e Link - com a "Cor do Titulo"
+# padrao (preto) o nome some. So esses 2 subtipos trocam pra branco.
+COR_TITULO_PADRAO = "#000000"
+COR_TITULO_CLARA = "#FFFFFF"
+SUBTIPOS_FRAME_ESCURO = {"Xyz", "Link"}
+
+
+async def _definir_cor_do_titulo(page: Page, subtipo: str) -> None:
+    """input[type=color] nao aceita `.fill()` do Playwright - seta o value
+    via JS e dispara input/change manualmente pra o site (Vue) reagir."""
+    cor = COR_TITULO_CLARA if subtipo in SUBTIPOS_FRAME_ESCURO else COR_TITULO_PADRAO
+    campo = _container(page, "Cor do Título").locator("input[type=color]")
+    await campo.evaluate(
+        "(el, cor) => {"
+        " el.value = cor;"
+        " el.dispatchEvent(new Event('input', {bubbles: true}));"
+        " el.dispatchEvent(new Event('change', {bubbles: true}));"
+        "}",
+        cor,
+    )
 
 
 class ConfigSubtipo:
@@ -261,13 +343,16 @@ async def fill_monster_card(
     imagem: CardImage | None = None,
     *,
     browser: Browser | None = None,
+    pasta_destino: Path | None = None,
 ) -> Path:
     """Busca a carta (ou usa uma ja carregada, ver _resolver_carta), preenche
     o Yu-Gi-Oh! Card Maker (dados + arte) e descarrega o resultado. Cobre
     qualquer monstro (Normal/Effect/Fusion/Ritual/Synchro/Xyz/Link, Pendulum
     ou nao, com traco Toon/Spirit/Union/Gemini/Flip/Tuner). Spell/Trap ficam
     de fora - ver fill_spell_trap_card. `imagem` escolhe a variante de arte;
-    `browser` reusa um Chromium ja aberto. Retorna o caminho do arquivo baixado.
+    `browser` reusa um Chromium ja aberto; `pasta_destino` (default
+    PASTA_CARTAS_AVULSAS) e onde o arquivo baixado vai parar. Retorna o
+    caminho do arquivo baixado.
     """
     carta = await _resolver_carta(nome_carta)
     if carta.type in (CardType.SPELL_CARD, CardType.TRAP_CARD):
@@ -314,6 +399,7 @@ async def fill_monster_card(
         await (
             _container(page, "Subtipo").locator("select").select_option(config.subtipo)
         )
+        await _definir_cor_do_titulo(page, config.subtipo)
 
         # traco1 SEMPRE antes de traco2 (ver nota em CONFIG_POR_TIPO)
         await _container(page, "Efeito").locator("select").select_option(config.traco1)
@@ -355,11 +441,15 @@ async def fill_monster_card(
         if config.pendulo:
             await _container(page, "AZUL").locator("input").fill(str(carta.scale))
             await _container(page, "VERMELHO").locator("input").fill(str(carta.scale))
-            texto_pendulo = carta.pend_desc or ""
+            texto_pendulo_ajustado, fonte_pendulo = _preparar_texto_e_fonte(
+                carta.pend_desc or "",
+                k_largura=_PENDULO_K_LARGURA,
+                k_altura=_PENDULO_K_ALTURA,
+            )
             await (
                 _container(page, "Efeito do Pêndulo")
                 .locator("textarea")
-                .fill(texto_pendulo)
+                .fill(texto_pendulo_ajustado)
             )
             # 2 campos identicos "Tamanho do Texto" no form (sem outro
             # jeito de diferenciar pelo label) - o 1o (nth(0)) e sempre o
@@ -369,7 +459,7 @@ async def fill_monster_card(
                 .nth(0)
                 .locator("..")
                 .locator("input")
-                .fill(str(_tamanho_fonte(texto_pendulo)))
+                .fill(str(fonte_pendulo))
             )
 
         # card de exemplo padrao do site vem com esse checkbox MARCADO
@@ -405,10 +495,13 @@ async def fill_monster_card(
         texto_principal = (
             (carta.monster_desc or carta.desc) if config.pendulo else carta.desc
         )
+        texto_principal_ajustado, fonte_principal = _preparar_texto_e_fonte(
+            texto_principal, linhas_reservadas=1
+        )
         await (
             _container(page, "Informação da Carta")
             .locator("textarea")
-            .fill(texto_principal)
+            .fill(texto_principal_ajustado)
         )
         # 2o "Tamanho do Texto" do form = o do texto principal (ver nota
         # identica no bloco do Efeito do Pendulo acima)
@@ -417,13 +510,15 @@ async def fill_monster_card(
             .nth(1)
             .locator("..")
             .locator("input")
-            .fill(str(_tamanho_fonte(texto_principal)))
+            .fill(str(fonte_principal))
         )
 
         # usa carta.name (nome oficial), nao o argumento recebido -
         # que pode ser so o texto de busca (parcial) quando fill_card
         # ainda nao tinha resolvido a carta
-        return await _descarregar_carta(page, carta.name, variante_usada.id)
+        return await _descarregar_carta(
+            page, carta.name, variante_usada.id, pasta_destino or PASTA_CARTAS_AVULSAS
+        )
 
 
 async def fill_spell_trap_card(
@@ -431,14 +526,16 @@ async def fill_spell_trap_card(
     imagem: CardImage | None = None,
     *,
     browser: Browser | None = None,
+    pasta_destino: Path | None = None,
 ) -> Path:
     """Busca a carta (ou usa uma ja carregada, ver _resolver_carta), preenche
     o Yu-Gi-Oh! Card Maker (dados + arte) e descarrega o resultado, pra uma
     Magia ou Armadilha. Bem mais simples que fill_monster_card: nenhum campo
     de monstro (Atributo/Tipo/Nivel/ATK/DEF/Pendulo/Link) existe pra
     Spell/Trap, todos ficam invisiveis no form. `imagem` escolhe a variante
-    de arte; `browser` reusa um Chromium ja aberto. Retorna o caminho do
-    arquivo baixado.
+    de arte; `browser` reusa um Chromium ja aberto; `pasta_destino` (default
+    PASTA_CARTAS_AVULSAS) e onde o arquivo baixado vai parar. Retorna o
+    caminho do arquivo baixado.
     """
     carta = await _resolver_carta(nome_carta)
     if carta.type not in (CardType.SPELL_CARD, CardType.TRAP_CARD):
@@ -468,8 +565,11 @@ async def fill_spell_trap_card(
         )
 
         await campo_nome.fill(carta.name)
+        texto_ajustado, fonte = _preparar_texto_e_fonte(
+            carta.desc, k_altura=_SPELL_TRAP_K_ALTURA
+        )
         await (
-            _container(page, "Informação da Carta").locator("textarea").fill(carta.desc)
+            _container(page, "Informação da Carta").locator("textarea").fill(texto_ajustado)
         )
         # mesmos 2 campos "Tamanho do Texto" do form de monstro continuam
         # no DOM aqui (so ficam ocultos, nao removidos) - nth(1) e sempre
@@ -479,10 +579,12 @@ async def fill_spell_trap_card(
             .nth(1)
             .locator("..")
             .locator("input")
-            .fill(str(_tamanho_fonte(carta.desc)))
+            .fill(str(fonte))
         )
 
-        return await _descarregar_carta(page, carta.name, variante_usada.id)
+        return await _descarregar_carta(
+            page, carta.name, variante_usada.id, pasta_destino or PASTA_CARTAS_AVULSAS
+        )
 
 
 async def fill_card(
@@ -490,13 +592,20 @@ async def fill_card(
     imagem: CardImage | None = None,
     *,
     browser: Browser | None = None,
+    pasta_destino: Path | None = None,
 ) -> Path:
     """Busca a carta (ou usa uma ja carregada, ver _resolver_carta) e despacha
     pro preenchimento certo (monstro vs magia/armadilha - formularios bem
     diferentes, cada um com seu proprio service). `imagem` escolhe a variante
-    de arte; `browser` reusa um Chromium ja aberto. Retorna o caminho baixado.
+    de arte; `browser` reusa um Chromium ja aberto; `pasta_destino` (default
+    PASTA_CARTAS_AVULSAS) e onde o arquivo baixado vai parar. Retorna o
+    caminho baixado.
     """
     carta = await _resolver_carta(nome_carta)
     if carta.type in (CardType.SPELL_CARD, CardType.TRAP_CARD):
-        return await fill_spell_trap_card(carta, imagem, browser=browser)
-    return await fill_monster_card(carta, imagem, browser=browser)
+        return await fill_spell_trap_card(
+            carta, imagem, browser=browser, pasta_destino=pasta_destino
+        )
+    return await fill_monster_card(
+        carta, imagem, browser=browser, pasta_destino=pasta_destino
+    )
