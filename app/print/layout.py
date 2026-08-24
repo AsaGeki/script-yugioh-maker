@@ -21,7 +21,7 @@ CARTAS_POR_FOLHA = COLUNAS * LINHAS
 
 # Espaco entre cartas vizinhas na grade - da margem de corte de verdade (a
 # linha vermelha fica no meio desse espaco), em vez de cartas coladas.
-ESPACO_ENTRE_CARTAS_MM = 2
+ESPACO_ENTRE_CARTAS_MM = 0
 LINHA_CORTE_COR = "red"
 LINHA_CORTE_ESPESSURA_PX = 3
 
