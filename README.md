@@ -40,6 +40,16 @@ gera direto, sem menu. Nenhuma variável em `.env` é obrigatória — `PORT`,
 Meu nome é Arthur Gabriel e este projeto veio com a ideia de facilitar a sintetização de cartas de Yu-Gi-Oh em portugues e com boa qualidade.
 Também feito para organiza-las e deixar pronto para impressão.
 
+## Créditos
+
+Este projeto não seria possível sem estes serviços e projetos de terceiros:
+
+- **[YGOPRODeck](https://ygoprodeck.com)** — API oficial com os dados de cada carta, decks públicos e structure decks.
+- **[yugiohcardmaker.org](https://yugiohcardmaker.org)** — gerador de imagem que a automação preenche.
+- **[Banco de dados oficial da Konami](https://www.db.yugioh-card.com)** — fallback de tradução PT quando a YGOPRODeck ainda não trouxe.
+
+Yu-Gi-Oh! é marca registrada da Konami. Este projeto não é afiliado a ela.
+
 ---
 
 Feito com esforço por [AsaGeki](https://github.com/AsaGeki) 🐧❤️
